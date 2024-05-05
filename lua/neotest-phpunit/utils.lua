@@ -1,5 +1,8 @@
 local logger = require("neotest.logging")
 
+local log = require("plenary.log"):new()
+-- log.level = 'debug'
+
 local M = {}
 local separator = "::"
 
@@ -9,6 +12,7 @@ local separator = "::"
 ---@return string
 M.make_test_id = function(position)
   -- Treesitter starts line numbers from 0 so we add 1
+  logger.info("make test id", position)
   local id = position.path .. separator .. (tonumber(position.range[1]) + 1)
 
   logger.info("Path to test file:", { position.path })

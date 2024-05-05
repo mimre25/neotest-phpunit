@@ -1,12 +1,15 @@
 local ok, async = pcall(require, "nio")
 if not ok then
-  async = require("neotest.async")
+    async = require("neotest.async")
 end
 
 local lib = require("neotest.lib")
 local logger = require("neotest.logging")
 local utils = require("neotest-phpunit.utils")
 local config = require("neotest-phpunit.config")
+
+local log = require("plenary.log"):new()
+-- log.level = 'debug'
 
 local dap_configuration
 
@@ -59,7 +62,7 @@ local NeotestAdapter = { name = "neotest-phpunit" }
 ---@param dir string @Directory to treat as cwd
 ---@return string | nil @Absolute root dir of test suite
 function NeotestAdapter.root(dir)
-  local result = nil
+    local result = nil
 
   for _, root_ignore_file in ipairs(config.get_root_ignore_files()) do
     result = lib.files.match_root_pattern(root_ignore_file)(dir)
@@ -75,14 +78,14 @@ function NeotestAdapter.root(dir)
     end
   end
 
-  return result
+    return result
 end
 
 ---@async
 ---@param file_path string
 ---@return boolean
 function NeotestAdapter.is_test_file(file_path)
-  return vim.endswith(file_path, "Test.php")
+    return vim.endswith(file_path, "Test.php")
 end
 
 ---Filter directories when searching for test files
@@ -96,7 +99,7 @@ function NeotestAdapter.filter_dir(name)
     end
   end
 
-  return true
+    return true
 end
 
 ---Given a file path, parse all the tests within it.
@@ -104,11 +107,11 @@ end
 ---@param file_path string Absolute file path
 ---@return neotest.Tree | nil
 function NeotestAdapter.discover_positions(path)
-  if not NeotestAdapter.is_test_file(path) then
-    return nil
-  end
+    if not NeotestAdapter.is_test_file(path) then
+        return nil
+    end
 
-  local query = [[
+    local query = [[
     ((class_declaration
       name: (name) @namespace.name (#match? @namespace.name "Test")
     )) @namespace.definition
@@ -134,56 +137,118 @@ function NeotestAdapter.discover_positions(path)
         (name) @test.name
       ) @test.definition
     ))
-  ]]
 
-  return lib.treesitter.parse_positions(path, query, {
-    position_id = "require('neotest-phpunit.utils').make_test_id",
-  })
+    (
+     (method_declaration
+      (attribute_list
+        (attribute_group
+            (attribute) @test_attribute (#match? @test_attribute "Test")
+        )
+      )
+      (
+        (visibility_modifier) @test.definition
+        (name) @test.name
+      )
+     )
+    )
+  ]]
+    return lib.treesitter.parse_positions(path, query, {
+        position_id = "require('neotest-phpunit.utils').make_test_id",
+    })
+end
+
+-- Plain replacement (all characters are non-magic)
+function string:replace(substring, replacement, n)
+    return (self:gsub(substring:gsub("%p", "%%%0"), replacement:gsub("%%", "%%%%"), n))
 end
 
 ---@param args neotest.RunArgs
 ---@return neotest.RunSpec | nil
 function NeotestAdapter.build_spec(args)
-  local position = args.tree:data()
-  local results_path = async.fn.tempname()
-  local program = config.get_phpunit_cmd()
+    -- log.debug("args", args)
+    local position = args.tree:data()
+    local results_path = async.fn.tempname()
+    local program = config.get_phpunit_cmd()
+    local cmd = type(program) == "string" and program or program[1]
+    if string.find(cmd, "sail") ~= nil and position.name ~= "tests" then
 
-  local script_args = {
-    position.name ~= "tests" and position.path,
-    "--log-junit=" .. results_path,
-  }
+          -- log.debug("logger fn", logger)
+        local root = NeotestAdapter.root(async.fn.getcwd())
 
-  if position.type == "test" then
-    local filter_args = vim.tbl_flatten({
-      "--filter",
-      "::" .. position.name .. "( with data set .*)?$",
+        position.path = string.sub(position.path, #root + 2)
+
+    end
+    local script_args = {
+        position.name ~= "tests" and position.path,
+        "--log-junit=" .. results_path,
+    }
+
+    if position.type == "test" then
+        local filter_args = vim.tbl_flatten({
+            "--filter",
+            '::' .. position.name .. '( with data set .*)?$',
+        })
+
+        logger.info("position.path:", { position.path })
+        logger.info("--filter position.name:", { position.name })
+
+        script_args = vim.tbl_flatten({
+            script_args,
+            filter_args,
+        })
+    end
+
+    local command = vim.tbl_flatten({
+        program,
+        script_args,
     })
+    local runspec = {
+        command = command,
+        context = {
+            results_path = results_path,
+        },
+        strategy = get_strategy_config(args.strategy, program, script_args),
+        env = args.env or config.get_env(),
+    }
+    ---@type neotest.RunSpec
+    return runspec
+end
 
-    logger.info("position.path:", { position.path })
-    logger.info("--filter position.name:", { position.name })
 
-    script_args = vim.tbl_flatten({
-      script_args,
-      filter_args,
-    })
-  end
+local handle_sail = function(sail, output_file)
+    local cmd = async.process.run({ cmd = sail, args = {"config", "--format", "json" }})
+    local sail_config  = vim.json.decode(cmd.stdout.read())
+    local sail_service
+    for service_name, service_config in pairs(sail_config["services"]) do
+       if string.find(service_config["image"], "sail") ~= nil then
+           sail_service = service_name
+        break
+       end
+    end
 
-  local command = vim.tbl_flatten({
-    program,
-    script_args,
-  })
 
-  logger.trace("PHPUnit command: ", { command })
+    --container name
+    local container_name = sail_config["name"] .. '-' .. sail_service .. '-1'
+    if sail_service ~= nil then
+        -- copy the output file from inside the container to the host
+        local sail_args = { "cp", sail_service .. ":" .. output_file, output_file }
+        local cp = async.process.run({ cmd = sail, args = sail_args })
+        log.debug("cp out", cp.stdout.read())
 
-  ---@type neotest.RunSpec
-  return {
-    command = command,
-    context = {
-      results_path = results_path,
-    },
-    strategy = get_strategy_config(args.strategy, program, script_args),
-    env = args.env or config.get_env(),
-  }
+        -- get the container's workdir for path replacement
+        local inspect_cmd = { cmd = 'docker', args = { "inspect", "--format", "{{.Config.WorkingDir}}", container_name } }
+        local sail_inspect = async.process.run(inspect_cmd)
+        local dockerPath = sail_inspect.stdout.read()
+        dockerPath = string.gsub(dockerPath, "\n", "")
+        log.debug("dockerpath ", dockerPath)
+
+        -- replace the path in the output file
+        -- (sed -i "s#$dockerPath#$projectPath#g" $outputPath)
+        local root = NeotestAdapter.root(async.fn.getcwd())
+        local sed_args ={ cmd = "sed", args = { "-i", "s#" .. dockerPath .. "#" .. root .. "#g", output_file } }
+        local sed = async.process.run(sed_args)
+        log.debug("sed out", sed.stdout.read())
+    end
 end
 
 ---@async
@@ -192,76 +257,77 @@ end
 ---@param tree neotest.Tree
 ---@return neotest.Result[]
 function NeotestAdapter.results(test, result, tree)
-  local output_file = test.context.results_path
+    local output_file = test.context.results_path
+    if string.find(test.command[1], "sail") ~= nil then
+        handle_sail(test.command[1], output_file)
+    end
 
-  local ok, data = pcall(lib.files.read, output_file)
-  if not ok then
-    logger.error("No test output file found:", output_file)
-    return {}
-  end
+    local ok, data = pcall(lib.files.read, output_file)
+    if not ok then
+        logger.error("No test output file found:", output_file)
+        return {}
+    end
 
-  local ok, parsed_data = pcall(lib.xml.parse, data)
-  if not ok then
-    logger.error("Failed to parse test output:", output_file)
-    return {}
-  end
+    local ok, parsed_data = pcall(lib.xml.parse, data)
+    if not ok then
+        logger.error("Failed to parse test output:", output_file)
+        return {}
+    end
 
-  local ok, results = pcall(utils.get_test_results, parsed_data, output_file)
-  if not ok then
-    logger.error("Could not get test results", output_file)
-    return {}
-  end
-
-  logger.trace("Results:", results)
-  return results
+    local ok, results = pcall(utils.get_test_results, parsed_data, output_file)
+    if not ok then
+        logger.error("Could not get test results", output_file)
+        return {}
+    end
+    return results
 end
 
 local is_callable = function(obj)
-  return type(obj) == "function" or (type(obj) == "table" and obj.__call)
+    return type(obj) == "function" or (type(obj) == "table" and obj.__call)
 end
 
 setmetatable(NeotestAdapter, {
-  __call = function(_, opts)
-    if is_callable(opts.phpunit_cmd) then
-      config.get_phpunit_cmd = opts.phpunit_cmd
-    elseif opts.phpunit_cmd then
-      config.get_phpunit_cmd = function()
-        return opts.phpunit_cmd
-      end
-    end
-    if is_callable(opts.root_ignore_files) then
-      config.get_root_ignore_files = opts.root_ignore_files
-    elseif opts.root_ignore_files then
-      config.get_root_ignore_files = function()
-        return opts.root_ignore_files
-      end
-    end
-    if is_callable(opts.root_files) then
-      config.get_root_files = opts.root_files
-    elseif opts.root_files then
-      config.get_root_files = function()
-        return opts.root_files
-      end
-    end
-    if is_callable(opts.filter_dirs) then
-      config.get_filter_dirs = opts.filter_dirs
-    elseif opts.filter_dirs then
-      config.get_filter_dirs = function()
-        return opts.filter_dirs
-      end
-    end
-    if is_callable(opts.env) then
-      config.get_env = opts.env
-    elseif type(opts.env) == "table" then
-      config.get_env = function()
-        return opts.env
-      end
-    end
-    if type(opts.dap) == "table" then
-      dap_configuration = opts.dap
-    end
-    return NeotestAdapter
-  end,
+    __call = function(_, opts)
+        if is_callable(opts.phpunit_cmd) then
+            config.get_phpunit_cmd = opts.phpunit_cmd
+        elseif opts.phpunit_cmd then
+            config.get_phpunit_cmd = function()
+                return opts.phpunit_cmd
+            end
+        end
+        if is_callable(opts.root_ignore_files) then
+            config.get_root_ignore_files = opts.root_ignore_files
+        elseif opts.root_ignore_files then
+            config.get_root_ignore_files = function()
+                return opts.root_ignore_files
+            end
+        end
+        if is_callable(opts.root_files) then
+            config.get_root_files = opts.root_files
+        elseif opts.root_files then
+            config.get_root_files = function()
+                return opts.root_files
+            end
+        end
+        if is_callable(opts.filter_dirs) then
+            config.get_filter_dirs = opts.filter_dirs
+        elseif opts.filter_dirs then
+            config.get_filter_dirs = function()
+                return opts.filter_dirs
+            end
+        end
+        if is_callable(opts.env) then
+            config.get_env = opts.env
+        elseif type(opts.env) == "table" then
+            config.get_env = function()
+                return opts.env
+            end
+        end
+        if type(opts.dap) == "table" then
+            dap_configuration = opts.dap
+        end
+        return NeotestAdapter
+    end,
 })
 
 return NeotestAdapter
